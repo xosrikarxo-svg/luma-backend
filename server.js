@@ -5,7 +5,7 @@ const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 
 const app = express();
-app.use(cors());
+app.use(cors({ origin: '*' }));
 app.use(express.json());
 
 const server = http.createServer(app);
@@ -14,7 +14,7 @@ const wss = new WebSocket.Server({ server });
 const waitingPool = [];
 const activeSessions = new Map();
 const connections = new Map();
-const reconnectPool = new Map(); // userId -> { peerId, timer }
+const reconnectPool = new Map();
 
 const PROMPTS = [
   "What's something you've been thinking about lately?",
@@ -82,19 +82,16 @@ wss.on('connection', (ws) => {
       send(ws, { type: 'joined', userId });
       tryMatch(userId, msg.tags || [], ws);
     }
-
     if (msg.type === 'message') {
       const session = activeSessions.get(userId);
       if (!session) return;
       send(session.peerWs, { type: 'message', text: msg.text });
     }
-
     if (msg.type === 'typing') {
       const session = activeSessions.get(userId);
       if (!session) return;
       send(session.peerWs, { type: 'typing' });
     }
-
     if (msg.type === 'new_prompt') {
       const session = activeSessions.get(userId);
       if (!session) return;
@@ -102,25 +99,20 @@ wss.on('connection', (ws) => {
       send(ws, { type: 'prompt', prompt });
       send(session.peerWs, { type: 'prompt', prompt });
     }
-
     if (msg.type === 'leave') {
       endSession(userId);
       removeFromQueue(userId);
     }
-
     if (msg.type === 'reconnect_request') {
       const targetId = msg.peerId;
       const peerEntry = reconnectPool.get(targetId);
-
       if (peerEntry && peerEntry.peerId === userId) {
-        // Both sides want to reconnect!
         clearTimeout(peerEntry.timer);
         reconnectPool.delete(targetId);
         reconnectPool.delete(userId);
         const peerWs = connections.get(targetId);
         if (peerWs) createSession(userId, ws, targetId, peerWs);
       } else {
-        // Wait up to 30s for the other person to also click reconnect
         const timer = setTimeout(() => {
           reconnectPool.delete(userId);
           send(ws, { type: 'reconnect_expired' });
@@ -142,6 +134,16 @@ wss.on('connection', (ws) => {
 });
 
 app.get('/health', (_, res) => res.json({ status: 'ok', waiting: waitingPool.length, active: activeSessions.size / 2 }));
+
+app.get('/queue-status', (_, res) => {
+  const counts = {};
+  waitingPool.forEach(u => {
+    u.tags.forEach(tag => {
+      counts[tag] = (counts[tag] || 0) + 1;
+    });
+  });
+  res.json(counts);
+});
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => console.log(`Luma backend running on port ${PORT}`));
