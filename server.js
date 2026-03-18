@@ -1,22 +1,22 @@
 const express = require('express');
 const http = require('http');
-const WebSocket = require('ws');
 const cors = require('cors');
+const { Server } = require('socket.io');
 const { v4: uuidv4 } = require('uuid');
 
 const app = express();
-app.use(cors());
+app.use(cors({ origin: '*' }));
 app.use(express.json());
 
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const io = new Server(server, {
+  cors: { origin: '*', methods: ['GET', 'POST'] },
+  transports: ['websocket', 'polling'],
+});
 
-// waiting pool: { userId, tags, ws }
 const waitingPool = [];
-// active sessions: userId -> { sessionId, peerId, peerWs }
 const activeSessions = new Map();
-// connections: userId -> ws
-const connections = new Map();
+const reconnectPool = new Map();
 
 const PROMPTS = [
   "What's something you've been thinking about lately?",
@@ -32,37 +32,35 @@ const PROMPTS = [
 ];
 
 const randPrompt = () => PROMPTS[Math.floor(Math.random() * PROMPTS.length)];
-const send = (ws, data) => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data)); };
 
-function tryMatch(userId, tags, ws) {
-  // Find someone in pool with at least one matching tag
+function createSession(idA, idB) {
+  const sessionId = uuidv4();
+  const prompt = randPrompt();
+  activeSessions.set(idA, { sessionId, peerId: idB });
+  activeSessions.set(idB, { sessionId, peerId: idA });
+  io.to(idA).emit('matched', { sessionId, prompt });
+  io.to(idB).emit('matched', { sessionId, prompt });
+}
+
+function tryMatch(userId, tags) {
   const idx = waitingPool.findIndex(u =>
     u.userId !== userId && u.tags.some(t => tags.includes(t))
   );
-
   if (idx !== -1) {
     const peer = waitingPool.splice(idx, 1)[0];
-    const sessionId = uuidv4();
-    const prompt = randPrompt();
-
-    activeSessions.set(userId, { sessionId, peerId: peer.userId, peerWs: peer.ws });
-    activeSessions.set(peer.userId, { sessionId, peerId: userId, peerWs: ws });
-
-    send(ws, { type: 'matched', sessionId, prompt });
-    send(peer.ws, { type: 'matched', sessionId, prompt });
+    createSession(userId, peer.userId);
   } else {
-    // Add to waiting pool
     const already = waitingPool.findIndex(u => u.userId === userId);
-    if (already === -1) waitingPool.push({ userId, tags, ws });
-    send(ws, { type: 'waiting' });
+    if (already === -1) waitingPool.push({ userId, tags });
+    io.to(userId).emit('waiting');
   }
 }
 
 function endSession(userId) {
   const session = activeSessions.get(userId);
   if (!session) return;
-  const { peerId, peerWs } = session;
-  send(peerWs, { type: 'peer_left' });
+  const { peerId } = session;
+  io.to(peerId).emit('peer_left', { peerId: userId });
   activeSessions.delete(userId);
   activeSessions.delete(peerId);
 }
@@ -72,55 +70,72 @@ function removeFromQueue(userId) {
   if (i !== -1) waitingPool.splice(i, 1);
 }
 
-wss.on('connection', (ws) => {
-  let userId = null;
+io.on('connection', (socket) => {
+  const userId = socket.id;
 
-  ws.on('message', (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw); } catch { return; }
+  socket.on('join', ({ tags }) => {
+    tryMatch(userId, tags || []);
+  });
 
-    if (msg.type === 'join') {
-      userId = uuidv4();
-      connections.set(userId, ws);
-      send(ws, { type: 'joined', userId });
-      tryMatch(userId, msg.tags || [], ws);
-    }
+  socket.on('message', ({ text }) => {
+    const session = activeSessions.get(userId);
+    if (!session) return;
+    io.to(session.peerId).emit('message', { text });
+  });
 
-    if (msg.type === 'message') {
-      const session = activeSessions.get(userId);
-      if (!session) return;
-      send(session.peerWs, { type: 'message', text: msg.text });
-    }
+  socket.on('typing', () => {
+    const session = activeSessions.get(userId);
+    if (!session) return;
+    io.to(session.peerId).emit('typing');
+  });
 
-    if (msg.type === 'typing') {
-      const session = activeSessions.get(userId);
-      if (!session) return;
-      send(session.peerWs, { type: 'typing' });
-    }
+  socket.on('new_prompt', () => {
+    const session = activeSessions.get(userId);
+    if (!session) return;
+    const prompt = randPrompt();
+    io.to(userId).emit('prompt', { prompt });
+    io.to(session.peerId).emit('prompt', { prompt });
+  });
 
-    if (msg.type === 'new_prompt') {
-      const session = activeSessions.get(userId);
-      if (!session) return;
-      const prompt = randPrompt();
-      send(ws, { type: 'prompt', prompt });
-      send(session.peerWs, { type: 'prompt', prompt });
-    }
+  socket.on('leave', () => {
+    endSession(userId);
+    removeFromQueue(userId);
+  });
 
-    if (msg.type === 'leave') {
-      endSession(userId);
-      removeFromQueue(userId);
+  socket.on('reconnect_request', ({ peerId: targetId }) => {
+    const peerEntry = reconnectPool.get(targetId);
+    if (peerEntry && peerEntry.peerId === userId) {
+      clearTimeout(peerEntry.timer);
+      reconnectPool.delete(targetId);
+      reconnectPool.delete(userId);
+      createSession(userId, targetId);
+    } else {
+      const timer = setTimeout(() => {
+        reconnectPool.delete(userId);
+        io.to(userId).emit('reconnect_expired');
+      }, 30000);
+      reconnectPool.set(userId, { peerId: targetId, timer });
+      io.to(userId).emit('reconnect_waiting');
     }
   });
 
-  ws.on('close', () => {
-    if (!userId) return;
-    connections.delete(userId);
+  socket.on('disconnect', () => {
     removeFromQueue(userId);
     endSession(userId);
+    const entry = reconnectPool.get(userId);
+    if (entry) { clearTimeout(entry.timer); reconnectPool.delete(userId); }
   });
 });
 
 app.get('/health', (_, res) => res.json({ status: 'ok', waiting: waitingPool.length, active: activeSessions.size / 2 }));
 
+app.get('/queue-status', (_, res) => {
+  const counts = {};
+  waitingPool.forEach(u => {
+    u.tags.forEach(tag => { counts[tag] = (counts[tag] || 0) + 1; });
+  });
+  res.json(counts);
+});
+
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Luma backend running on http://localhost:${PORT}`));
+server.listen(PORT, '0.0.0.0', () => console.log(`Luma running on port ${PORT}`));
