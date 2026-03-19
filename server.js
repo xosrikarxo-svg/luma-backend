@@ -16,7 +16,7 @@ const io = new Server(server, {
 
 const waitingPool = [];
 const activeSessions = new Map();
-const reconnectPool = new Map();
+const reconnectPool = new Map(); // userId -> { peerId, timer }
 
 const PROMPTS = [
   "What's something you've been thinking about lately?",
@@ -70,12 +70,15 @@ function removeFromQueue(userId) {
   if (i !== -1) waitingPool.splice(i, 1);
 }
 
+function clearReconnect(userId) {
+  const entry = reconnectPool.get(userId);
+  if (entry) { clearTimeout(entry.timer); reconnectPool.delete(userId); }
+}
+
 io.on('connection', (socket) => {
   const userId = socket.id;
 
-  socket.on('join', ({ tags }) => {
-    tryMatch(userId, tags || []);
-  });
+  socket.on('join', ({ tags }) => tryMatch(userId, tags || []));
 
   socket.on('message', ({ text }) => {
     const session = activeSessions.get(userId);
@@ -102,28 +105,42 @@ io.on('connection', (socket) => {
     removeFromQueue(userId);
   });
 
+  // Person A clicks "Reconnect" → notify Person B
   socket.on('reconnect_request', ({ peerId: targetId }) => {
-    const peerEntry = reconnectPool.get(targetId);
-    if (peerEntry && peerEntry.peerId === userId) {
-      clearTimeout(peerEntry.timer);
-      reconnectPool.delete(targetId);
+    // Notify the peer that someone wants to reconnect
+    io.to(targetId).emit('reconnect_incoming', { fromId: userId });
+
+    // Start 15s timer — if peer doesn't accept in time, expire
+    const timer = setTimeout(() => {
       reconnectPool.delete(userId);
-      createSession(userId, targetId);
-    } else {
-      const timer = setTimeout(() => {
-        reconnectPool.delete(userId);
-        io.to(userId).emit('reconnect_expired');
-      }, 30000);
-      reconnectPool.set(userId, { peerId: targetId, timer });
-      io.to(userId).emit('reconnect_waiting');
+      io.to(userId).emit('reconnect_expired');
+      io.to(targetId).emit('reconnect_expired');
+    }, 15000);
+
+    reconnectPool.set(userId, { peerId: targetId, timer });
+  });
+
+  // Person B clicks "Accept" → both reconnect
+  socket.on('reconnect_accept', ({ fromId }) => {
+    const entry = reconnectPool.get(fromId);
+    if (entry && entry.peerId === userId) {
+      clearTimeout(entry.timer);
+      reconnectPool.delete(fromId);
+      clearReconnect(userId);
+      createSession(userId, fromId);
     }
+  });
+
+  // Person B clicks "Decline"
+  socket.on('reconnect_decline', ({ fromId }) => {
+    clearReconnect(fromId);
+    io.to(fromId).emit('reconnect_declined');
   });
 
   socket.on('disconnect', () => {
     removeFromQueue(userId);
     endSession(userId);
-    const entry = reconnectPool.get(userId);
-    if (entry) { clearTimeout(entry.timer); reconnectPool.delete(userId); }
+    clearReconnect(userId);
   });
 });
 
