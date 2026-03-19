@@ -16,7 +16,7 @@ const io = new Server(server, {
 
 const waitingPool = [];
 const activeSessions = new Map();
-const reconnectPool = new Map(); // userId -> { peerId, timer }
+const reconnectPool = new Map();
 
 const PROMPTS = [
   "What's something you've been thinking about lately?",
@@ -60,6 +60,9 @@ function endSession(userId) {
   const session = activeSessions.get(userId);
   if (!session) return;
   const { peerId } = session;
+  // Tell Person A who their peer was (so they can reconnect)
+  io.to(userId).emit('session_ended', { peerId });
+  // Tell Person B who left (so they can reconnect)
   io.to(peerId).emit('peer_left', { peerId: userId });
   activeSessions.delete(userId);
   activeSessions.delete(peerId);
@@ -105,22 +108,16 @@ io.on('connection', (socket) => {
     removeFromQueue(userId);
   });
 
-  // Person A clicks "Reconnect" → notify Person B
   socket.on('reconnect_request', ({ peerId: targetId }) => {
-    // Notify the peer that someone wants to reconnect
     io.to(targetId).emit('reconnect_incoming', { fromId: userId });
-
-    // Start 15s timer — if peer doesn't accept in time, expire
     const timer = setTimeout(() => {
       reconnectPool.delete(userId);
       io.to(userId).emit('reconnect_expired');
       io.to(targetId).emit('reconnect_expired');
     }, 15000);
-
     reconnectPool.set(userId, { peerId: targetId, timer });
   });
 
-  // Person B clicks "Accept" → both reconnect
   socket.on('reconnect_accept', ({ fromId }) => {
     const entry = reconnectPool.get(fromId);
     if (entry && entry.peerId === userId) {
@@ -131,7 +128,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Person B clicks "Decline"
   socket.on('reconnect_decline', ({ fromId }) => {
     clearReconnect(fromId);
     io.to(fromId).emit('reconnect_declined');
