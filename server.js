@@ -95,6 +95,12 @@ io.on('connection', (socket) => {
     io.to(session.peerId).emit('typing');
   });
 
+  socket.on('message_blocked', ({ label }) => {
+    const session = activeSessions.get(userId);
+    if (!session) return;
+    io.to(session.peerId).emit('peer_message_blocked', { label });
+  });
+
   socket.on('new_prompt', () => {
     const session = activeSessions.get(userId);
     if (!session) return;
