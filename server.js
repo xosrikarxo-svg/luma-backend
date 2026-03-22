@@ -86,6 +86,7 @@ io.on('connection', (socket) => {
   socket.on('message', ({ text }) => {
     const session = activeSessions.get(userId);
     if (!session) return;
+    console.log('TEST - SERVER CAN READ:', text);
     io.to(session.peerId).emit('message', { text });
   });
 
@@ -93,6 +94,12 @@ io.on('connection', (socket) => {
     const session = activeSessions.get(userId);
     if (!session) return;
     io.to(session.peerId).emit('typing');
+  });
+
+  socket.on('public_key', ({ publicKey }) => {
+    const session = activeSessions.get(userId);
+    if (!session) return;
+    io.to(session.peerId).emit('peer_public_key', { publicKey });
   });
 
   socket.on('message_blocked', ({ label }) => {
